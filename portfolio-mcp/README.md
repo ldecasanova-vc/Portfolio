@@ -84,6 +84,22 @@ gcloud run deploy portfolio-mcp \
 
 ---
 
+## Parte C — Nube sin clave descargada (recomendado)
+
+Si no hay `GOOGLE_CREDENTIALS_JSON` ni `credentials.json`, el servidor usa las credenciales por defecto de Google. En Cloud Run eso es la Service Account con la que corre el servicio, así que no hace falta descargar ni guardar ninguna clave:
+
+```bash
+gcloud run deploy portfolio-mcp \
+  --source . \
+  --region us-central1 \
+  --service-account portfolio-mcp@graphite-prism-489917-p6.iam.gserviceaccount.com \
+  --remove-secrets GOOGLE_CREDENTIALS_JSON
+```
+
+El Sheet master debe estar compartido (Lector) con el correo de esa Service Account, y la API de Sheets habilitada en el proyecto.
+
+---
+
 ## Notas importantes
 
 - **`credentials.json` nunca se sube a la imagen** (`.dockerignore` lo excluye) — va como secreto de Google Secret Manager, separado del código.

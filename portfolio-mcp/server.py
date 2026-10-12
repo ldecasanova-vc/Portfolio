@@ -22,6 +22,8 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from pydantic import AnyHttpUrl, BaseModel, Field, ConfigDict
 
+import google.auth
+import google.auth.exceptions
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -89,22 +91,28 @@ KEY_METRICS = {
 # ---------------------------------------------------------------------------
 
 def _build_sheets_client():
-    """Credenciales desde GOOGLE_CREDENTIALS_JSON (deploy en la nube, el JSON
-    completo de la Service Account como valor de la variable) o desde
-    credentials.json en disco (uso local, sin cambios respecto a antes)."""
+    """Credenciales, en este orden:
+    1. GOOGLE_CREDENTIALS_JSON: el JSON completo de una Service Account.
+    2. credentials.json en disco (uso local con clave).
+    3. Credenciales por defecto de Google (ADC): en Cloud Run, la Service
+       Account con la que corre el servicio, sin clave descargada; en local,
+       las de `gcloud auth application-default login`."""
     env_json = os.environ.get(GOOGLE_CREDENTIALS_JSON_ENV)
     if env_json:
         info = json.loads(env_json)
         creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    else:
-        if not CREDENTIALS_FILE.exists():
-            raise RuntimeError(
-                f"No se encontró credentials.json en {CREDENTIALS_FILE}, ni la variable de "
-                f"entorno {GOOGLE_CREDENTIALS_JSON_ENV}.\nSigue el README para configurar la Service Account."
-            )
+    elif CREDENTIALS_FILE.exists():
         creds = service_account.Credentials.from_service_account_file(
             str(CREDENTIALS_FILE), scopes=SCOPES
         )
+    else:
+        try:
+            creds, _ = google.auth.default(scopes=SCOPES)
+        except google.auth.exceptions.DefaultCredentialsError as e:
+            raise RuntimeError(
+                f"Sin credenciales: no hay {GOOGLE_CREDENTIALS_JSON_ENV}, ni credentials.json en "
+                f"{CREDENTIALS_FILE}, ni credenciales por defecto de Google.\nSigue el README."
+            ) from e
     return build("sheets", "v4", credentials=creds, cache_discovery=False).spreadsheets()
 
 SHEETS_CLIENT = _build_sheets_client()

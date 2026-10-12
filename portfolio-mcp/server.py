@@ -11,6 +11,7 @@ Prerequisitos:
   pip install -r requirements.txt
 """
 
+import base64
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from typing import Literal, Optional
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import Icon
 from pydantic import AnyHttpUrl, BaseModel, Field, ConfigDict
 
 import google.auth
@@ -32,6 +34,8 @@ from googleapiclient.discovery import build
 # ---------------------------------------------------------------------------
 
 CREDENTIALS_FILE = Path(__file__).parent / "credentials.json"
+ICON_FILE = Path(__file__).parent / "icon.png"
+FAVICON_FILE = Path(__file__).parent / "favicon.ico"
 GOOGLE_CREDENTIALS_JSON_ENV = "GOOGLE_CREDENTIALS_JSON"
 
 MASTER_SPREADSHEET_ID = "12SVOSvGTRaq0f_EyyeLDWWFsSnV1HSKTUv8hZzi5Xms"
@@ -132,6 +136,16 @@ AUTH_USERNAME = os.environ.get("MCP_AUTH_USERNAME")
 AUTH_PASSWORD = os.environ.get("MCP_AUTH_PASSWORD")
 PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").rstrip("/")
 HTTP_MODE = os.environ.get("MCP_TRANSPORT", "stdio").lower() == "http"
+
+# Logo que el cliente (claude.ai, Desktop) puede mostrar junto al conector.
+ICONS = (
+    [Icon(
+        src="data:image/png;base64," + base64.b64encode(ICON_FILE.read_bytes()).decode(),
+        mimeType="image/png",
+        sizes=["256x256"],
+    )]
+    if ICON_FILE.exists() else None
+)
 
 if HTTP_MODE:
     from starlette.exceptions import HTTPException
@@ -324,6 +338,7 @@ if HTTP_MODE:
     oauth_provider = SimpleOAuthProvider()
     mcp = FastMCP(
         "portfolio_mcp",
+        icons=ICONS,
         auth_server_provider=oauth_provider,
         auth=AuthSettings(
             issuer_url=AnyHttpUrl(PUBLIC_URL),
@@ -348,8 +363,20 @@ if HTTP_MODE:
     async def login_callback_handler(request):
         return await oauth_provider.handle_login_callback(request)
 
+    @mcp.custom_route("/favicon.ico", methods=["GET"])
+    async def favicon_handler(request):
+        if not FAVICON_FILE.exists():
+            raise HTTPException(404)
+        return Response(FAVICON_FILE.read_bytes(), media_type="image/x-icon")
+
+    @mcp.custom_route("/icon.png", methods=["GET"])
+    async def icon_handler(request):
+        if not ICON_FILE.exists():
+            raise HTTPException(404)
+        return Response(ICON_FILE.read_bytes(), media_type="image/png")
+
 else:
-    mcp = FastMCP("portfolio_mcp")
+    mcp = FastMCP("portfolio_mcp", icons=ICONS)
 
 # ---------------------------------------------------------------------------
 # Helpers de parsing

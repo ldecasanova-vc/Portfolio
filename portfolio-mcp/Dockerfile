@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py .
+COPY server.py icon.png favicon.ico ./
 
 # Cloud Run injects PORT; server.py reads it. Never COPY credentials.json here —
 # the cloud deployment gets credentials via the GOOGLE_CREDENTIALS_JSON env var.

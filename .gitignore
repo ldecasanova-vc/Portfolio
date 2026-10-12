@@ -1,0 +1,7 @@
+# Credenciales: nunca versionar. En la nube viven en Secret Manager.
+credentials.json
+*.json.key
+.env
+
+__pycache__/
+*.pyc

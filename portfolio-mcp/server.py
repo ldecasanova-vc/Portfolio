@@ -12,7 +12,9 @@ Prerequisitos:
 """
 
 import base64
+import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -183,36 +185,92 @@ if HTTP_MODE:
         PUBLIC_URL = "http://localhost:8080"
 
     MCP_SCOPE = "portfolio"
+    ACCESS_TOKEN_TTL = 3600 * 24 * 7    # 7 días
+    REFRESH_TOKEN_TTL = 3600 * 24 * 90  # 90 días
+
+    class SessionStore:
+        """Guarda registros de clientes, logins en curso y tokens.
+
+        Con MCP_SESSION_STORE=firestore se guardan en Firestore y sobreviven a
+        reinicios, escalado a cero y redeploys de Cloud Run. Sin esa variable
+        quedan solo en memoria (uso local o pruebas). Las claves se guardan
+        como hash SHA-256, así que Firestore nunca contiene un token usable.
+        Cada instancia mantiene además una copia en memoria para no leer
+        Firestore en cada consulta."""
+
+        def __init__(self, backend: str):
+            self.cache: dict[tuple[str, str], dict] = {}
+            self.db = None
+            if backend == "firestore":
+                from google.cloud import firestore
+                self.db = firestore.AsyncClient()
+            elif backend not in ("", "memory"):
+                raise RuntimeError(f"MCP_SESSION_STORE desconocido: {backend!r} (usa 'firestore' o 'memory')")
+
+        @staticmethod
+        def _doc_id(key: str) -> str:
+            return hashlib.sha256(key.encode()).hexdigest()
+
+        async def get(self, kind: str, key: str) -> dict | None:
+            cached = self.cache.get((kind, key))
+            if cached is not None or self.db is None:
+                return cached
+            snap = await self.db.collection(f"mcp_{kind}").document(self._doc_id(key)).get()
+            if not snap.exists:
+                return None
+            data = snap.to_dict()
+            self.cache[(kind, key)] = data
+            return data
+
+        async def set(self, kind: str, key: str, data: dict) -> None:
+            self.cache[(kind, key)] = data
+            if self.db is not None:
+                await self.db.collection(f"mcp_{kind}").document(self._doc_id(key)).set(data)
+
+        async def delete(self, kind: str, key: str) -> None:
+            self.cache.pop((kind, key), None)
+            if self.db is not None:
+                await self.db.collection(f"mcp_{kind}").document(self._doc_id(key)).delete()
+
+    session_store = SessionStore(os.environ.get("MCP_SESSION_STORE", "memory").lower())
+
+    class _IgnoreStatelessRouterNoise(logging.Filter):
+        """mcp 1.16 en modo stateless registra 'Error in message router'
+        (ClosedResourceError) al cerrar cada consulta, aunque respondió bien.
+        Se descarta solo ese caso para no llenar los logs de errores falsos."""
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            exc = record.exc_info[1] if record.exc_info else None
+            return not (record.getMessage() == "Error in message router" and type(exc).__name__ == "ClosedResourceError")
+
+    logging.getLogger("mcp.server.streamable_http").addFilter(_IgnoreStatelessRouterNoise())
 
     class SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
-        """Servidor de autorización mínimo: un solo usuario (tú), login por
-        formulario con usuario/contraseña fijos (MCP_AUTH_USERNAME/PASSWORD),
-        códigos y tokens en memoria. Si el servicio se reinicia hay que volver
-        a aprobar el acceso desde claude.ai — aceptable para uso personal."""
-
-        def __init__(self):
-            self.clients: dict[str, OAuthClientInformationFull] = {}
-            self.auth_codes: dict[str, AuthorizationCode] = {}
-            self.tokens: dict[str, AccessToken] = {}
-            self.state_mapping: dict[str, dict[str, str | None]] = {}
+        """Servidor de autorización mínimo: login por formulario con
+        usuario/contraseña fijos (MCP_AUTH_USERNAME/PASSWORD). Clientes,
+        códigos y tokens viven en session_store; con Firestore la conexión de
+        claude.ai sobrevive a reinicios y redeploys, y el refresh token la
+        renueva sin volver a pedir login."""
 
         async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-            return self.clients.get(client_id)
+            data = await session_store.get("clients", client_id)
+            return OAuthClientInformationFull.model_validate(data) if data else None
 
         async def register_client(self, client_info: OAuthClientInformationFull) -> None:
             if not client_info.client_id:
                 raise ValueError("No client_id provided")
-            self.clients[client_info.client_id] = client_info
+            await session_store.set("clients", client_info.client_id, client_info.model_dump(mode="json"))
 
         async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
             state = params.state or secrets.token_hex(16)
-            self.state_mapping[state] = {
+            await session_store.set("states", state, {
                 "redirect_uri": str(params.redirect_uri),
                 "code_challenge": params.code_challenge,
                 "redirect_uri_provided_explicitly": str(params.redirect_uri_provided_explicitly),
                 "client_id": client.client_id,
                 "resource": params.resource,
-            }
+                "expires_at": time.time() + 600,
+            })
             return f"{PUBLIC_URL}/login?state={state}&client_id={client.client_id}"
 
         async def get_login_page(self, state: str) -> HTMLResponse:
@@ -259,8 +317,8 @@ if HTTP_MODE:
             if not isinstance(username, str) or not isinstance(password, str) or not isinstance(state, str):
                 raise HTTPException(400, "Missing or invalid username, password, or state parameter")
 
-            state_data = self.state_mapping.get(state)
-            if not state_data:
+            state_data = await session_store.get("states", state)
+            if not state_data or state_data.get("expires_at", 0) < time.time():
                 raise HTTPException(400, "Invalid state parameter")
 
             if not secrets.compare_digest(username, AUTH_USERNAME) or not secrets.compare_digest(password, AUTH_PASSWORD):
@@ -274,7 +332,7 @@ if HTTP_MODE:
             assert redirect_uri is not None and code_challenge is not None and client_id is not None
 
             new_code = f"mcp_{secrets.token_hex(16)}"
-            self.auth_codes[new_code] = AuthorizationCode(
+            auth_code = AuthorizationCode(
                 code=new_code,
                 client_id=client_id,
                 redirect_uri=AnyHttpUrl(redirect_uri),
@@ -284,56 +342,74 @@ if HTTP_MODE:
                 code_challenge=code_challenge,
                 resource=resource,
             )
-            del self.state_mapping[state]
+            await session_store.set("codes", new_code, auth_code.model_dump(mode="json"))
+            await session_store.delete("states", state)
             return RedirectResponse(url=construct_redirect_uri(redirect_uri, code=new_code, state=state), status_code=302)
 
         async def load_authorization_code(
             self, client: OAuthClientInformationFull, authorization_code: str
         ) -> AuthorizationCode | None:
-            return self.auth_codes.get(authorization_code)
+            data = await session_store.get("codes", authorization_code)
+            return AuthorizationCode.model_validate(data) if data else None
+
+        async def _issue_tokens(self, client_id: str, scopes: list[str], resource: str | None) -> OAuthToken:
+            now = int(time.time())
+            access = f"mcp_{secrets.token_hex(32)}"
+            refresh = f"mcp_r_{secrets.token_hex(32)}"
+            await session_store.set("access_tokens", access, AccessToken(
+                token=access, client_id=client_id, scopes=scopes,
+                expires_at=now + ACCESS_TOKEN_TTL, resource=resource,
+            ).model_dump(mode="json"))
+            await session_store.set("refresh_tokens", refresh, {
+                **RefreshToken(
+                    token=refresh, client_id=client_id, scopes=scopes,
+                    expires_at=now + REFRESH_TOKEN_TTL,
+                ).model_dump(mode="json"),
+                "resource": resource,
+            })
+            return OAuthToken(
+                access_token=access, token_type="Bearer", expires_in=ACCESS_TOKEN_TTL,
+                refresh_token=refresh, scope=" ".join(scopes),
+            )
 
         async def exchange_authorization_code(
             self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
         ) -> OAuthToken:
-            if authorization_code.code not in self.auth_codes:
+            if not await session_store.get("codes", authorization_code.code):
                 raise ValueError("Invalid authorization code")
             if not client.client_id:
                 raise ValueError("No client_id provided")
-
-            token = f"mcp_{secrets.token_hex(32)}"
-            self.tokens[token] = AccessToken(
-                token=token,
-                client_id=client.client_id,
-                scopes=authorization_code.scopes,
-                expires_at=int(time.time()) + 3600 * 24 * 7,  # 7 días
-                resource=authorization_code.resource,
-            )
-            del self.auth_codes[authorization_code.code]
-            return OAuthToken(
-                access_token=token, token_type="Bearer", expires_in=3600 * 24 * 7,
-                scope=" ".join(authorization_code.scopes),
-            )
+            await session_store.delete("codes", authorization_code.code)
+            return await self._issue_tokens(client.client_id, authorization_code.scopes, authorization_code.resource)
 
         async def load_access_token(self, token: str) -> AccessToken | None:
-            access_token = self.tokens.get(token)
-            if not access_token:
+            data = await session_store.get("access_tokens", token)
+            if not data:
                 return None
+            access_token = AccessToken.model_validate(data)
             if access_token.expires_at and access_token.expires_at < time.time():
-                del self.tokens[token]
+                await session_store.delete("access_tokens", token)
                 return None
             return access_token
 
         async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
-            return None
+            data = await session_store.get("refresh_tokens", refresh_token)
+            return RefreshToken.model_validate(data) if data else None
 
         async def exchange_refresh_token(
             self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str],
         ) -> OAuthToken:
-            raise NotImplementedError("Refresh tokens not supported")
+            # Rotación: el refresh token usado deja de servir y se entrega uno nuevo.
+            data = await session_store.get("refresh_tokens", refresh_token.token) or {}
+            await session_store.delete("refresh_tokens", refresh_token.token)
+            if not client.client_id:
+                raise ValueError("No client_id provided")
+            return await self._issue_tokens(client.client_id, scopes, data.get("resource"))
 
         async def revoke_token(self, token, token_type_hint: str | None = None) -> None:
             tok = token.token if hasattr(token, "token") else token
-            self.tokens.pop(tok, None)
+            await session_store.delete("access_tokens", tok)
+            await session_store.delete("refresh_tokens", tok)
 
     oauth_provider = SimpleOAuthProvider()
     mcp = FastMCP(
@@ -350,6 +426,9 @@ if HTTP_MODE:
         ),
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8080)),
+        # Sin sesiones MCP en memoria: cada consulta es independiente, así un
+        # reinicio del contenedor no deja a claude.ai con una sesión inválida.
+        stateless_http=True,
     )
 
     @mcp.custom_route("/login", methods=["GET"])

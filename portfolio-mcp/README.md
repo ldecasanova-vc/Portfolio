@@ -103,6 +103,6 @@ El Sheet master debe estar compartido (Lector) con el correo de esa Service Acco
 ## Notas importantes
 
 - **`credentials.json` nunca se sube a la imagen** (`.dockerignore` lo excluye) — va como secreto de Google Secret Manager, separado del código.
-- **El estado de las sesiones OAuth vive en memoria.** Si Cloud Run reinicia el contenedor (por ejemplo tras un redeploy, o si escala a cero por inactividad y luego arranca de nuevo), vas a tener que volver a aprobar el acceso en claude.ai. Para uso personal esto es un costo aceptable; si se vuelve molesto, el siguiente paso natural es persistir tokens en una base de datos en vez de un diccionario en memoria.
+- **Sesiones OAuth persistentes.** Con `MCP_SESSION_STORE=firestore`, los registros de cliente y los tokens se guardan en Firestore (colecciones `mcp_*`, con las claves como hash SHA-256), así que la conexión de claude.ai sobrevive a reinicios, escalado a cero y redeploys. El access token dura 7 días y se renueva solo con un refresh token de 90 días. Sin esa variable, todo queda en memoria y hay que reconectar tras cada reinicio. Requisitos: base de datos Firestore `(default)` en el proyecto y el rol `roles/datastore.user` para la service account.
 - **Costo:** Cloud Run cobra por uso; para el volumen de consultas de un solo usuario probablemente quedes dentro de la capa gratuita mensual de Cloud Run.
 - **El MCP local (Desktop) y el de la nube son instancias independientes** — ambos leen el mismo Master, pero no comparten sesión ni estado entre sí.
